@@ -47,6 +47,8 @@ import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Method;
 import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.annotation.CheckForNull;
@@ -210,9 +212,44 @@ public class MailSender {
         return msg;
     }
 
+    /** @see AbstractBuild#getCulprits() */
+    private Set<User> getCulprits(Run<?, ?> build) {
+        final Set<User> r;
+        if (build instanceof AbstractBuild) {
+            r = ((AbstractBuild<?, ?>)build).getCulprits();
+        } else {
+            r = new HashSet<User>();
+            Run<?, ?> p = build.getPreviousCompletedBuild();
+            if (p != null) {
+                Result pr = p.getResult();
+                if (pr != null && pr.isWorseThan(Result.SUCCESS)) {
+                    LOGGER.log(Level.FINE, "Including culprits from previous build " + build);
+                    r.addAll(getCulprits(p));
+                }
+            }
+            for (ChangeLogSet.Entry e : getChangeSet(build)) {
+                r.add(e.getAuthor());
+            }
+        }
+        LOGGER.log(Level.FINE, "Culprits for " + build + ": " + r);
+        return r;
+    }
+
     private static ChangeLogSet<? extends ChangeLogSet.Entry> getChangeSet(Run<?,?> build) {
         if (build instanceof AbstractBuild) {
             return ((AbstractBuild<?,?>) build).getChangeSet();
+        } else if (build.getClass().getName().equals("org.jenkinsci.plugins.workflow.job.WorkflowRun")) {
+            LOGGER.log(Level.FINE, "Using reflection to determine changelog for pipeline job " + build);
+            try {
+                Method getChangeSets = build.getClass().getMethod("getChangeSets");
+                Object getChangeSetsResult = getChangeSets.invoke(build);
+                @SuppressWarnings("unchecked")
+                List<ChangeLogSet<? extends ChangeLogSet.Entry>> changeLogList = (List<ChangeLogSet<? extends ChangeLogSet.Entry>>)getChangeSetsResult;
+                return changeLogList.isEmpty() ? ChangeLogSet.createEmpty(build) : changeLogList.get(0);
+            } catch (Exception e) {
+                LOGGER.log(Level.SEVERE, "Could not invoke getChangeSets() on " + build + " - " + e, e);
+                return ChangeLogSet.createEmpty(build);
+            }
         } else {
             // TODO JENKINS-24141 call getChangeSets in general
             return ChangeLogSet.createEmpty(build);
@@ -379,8 +416,8 @@ public class MailSender {
             messageBuilder.addRecipients(getCulpritsOfEmailList(project, (AbstractBuild) build, listener));
         }
 
-        if (sendToIndividuals && build instanceof AbstractBuild) {
-            Set<User> culprits = ((AbstractBuild) build).getCulprits();
+        if (sendToIndividuals) {
+            Set<User> culprits = getCulprits(build);
 
             if(debug)
                 listener.getLogger().println("Trying to send e-mails to individuals who broke the build. sizeof(culprits)=="+culprits.size());
@@ -484,4 +521,5 @@ public class MailSender {
 
     private static final int MAX_LOG_LINES = Integer.getInteger(MailSender.class.getName()+".maxLogLines",250);
 
+    private static final Logger LOGGER = Logger.getLogger(MailSender.class.getName());
 }

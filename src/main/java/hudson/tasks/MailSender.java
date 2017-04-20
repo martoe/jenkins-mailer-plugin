@@ -30,10 +30,11 @@ import hudson.Util;
 import hudson.Functions;
 import hudson.model.*;
 import hudson.scm.ChangeLogSet;
-import hudson.tasks.i18n.Messages;
+import jenkins.plugins.mailer.tasks.i18n.Messages;
 import jenkins.model.Jenkins;
 import jenkins.plugins.mailer.tasks.MailAddressFilter;
 import jenkins.plugins.mailer.tasks.MimeMessageBuilder;
+import org.jenkinsci.plugins.displayurlapi.DisplayURLProvider;
 
 import javax.mail.Address;
 import javax.mail.MessagingException;
@@ -53,6 +54,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
+import org.acegisecurity.Authentication;
+import org.acegisecurity.userdetails.UsernameNotFoundException;
 
 /**
  * Core logic of sending out notification e-mail.
@@ -134,9 +137,7 @@ public class MailSender {
                     listener.getLogger().println(Messages.MailSender_ListEmpty());
                 }
             }
-        } catch (MessagingException e) {
-            e.printStackTrace(listener.error(e.getMessage()));
-        } catch (UnsupportedEncodingException e) {
+        } catch (MessagingException | UnsupportedEncodingException e) {
             e.printStackTrace(listener.error(e.getMessage()));
         }
     }
@@ -272,27 +273,30 @@ public class MailSender {
             }
         }
 
-        msg.setSubject(getSubject(build, subject),charset);
+        msg.setSubject(getSubject(build, subject), charset);
         StringBuilder buf = new StringBuilder();
+        DisplayURLProvider displayURLProvider = DisplayURLProvider.get();
         // Link to project changes summary for "still unstable" if this or last build has changes
-        if (still && !(getChangeSet(build).isEmptySet() && getChangeSet(prev).isEmptySet()))
-            appendUrl(Util.encode(build.getParent().getUrl()) + "changes", buf);
-        else
+        if (still && !(getChangeSet(build).isEmptySet() && getChangeSet(prev).isEmptySet())) {
+            appendUrl(displayURLProvider.getChangesURL(build), buf);
+        } else {
             appendBuildUrl(build, buf);
+        }
         msg.setText(buf.toString(), charset);
 
         return msg;
     }
 
     private void appendBuildUrl(Run<?, ?> build, StringBuilder buf) {
-        appendUrl(Util.encode(build.getUrl())
-                  + (getChangeSet(build).isEmptySet() ? "" : "changes"), buf);
+        if (getChangeSet(build).isEmptySet()) {
+            appendUrl(DisplayURLProvider.get().getRunURL(build), buf);
+        } else {
+            appendUrl(DisplayURLProvider.get().getChangesURL(build), buf);
+        }
     }
 
     private void appendUrl(String url, StringBuilder buf) {
-        String baseUrl = Mailer.descriptor().getUrl();
-        if (baseUrl != null)
-            buf.append(Messages.MailSender_Link(baseUrl, url)).append("\n\n");
+        buf.append(Messages.MailSender_Link(url)).append("\n\n");
     }
 
     private MimeMessage createFailureMail(Run<?, ?> build, TaskListener listener) throws MessagingException, UnsupportedEncodingException, InterruptedException {
@@ -380,7 +384,7 @@ public class MailSender {
         return msg;
     }
 
-    private MimeMessage createEmptyMail(final Run<?, ?> build, final TaskListener listener) throws MessagingException, UnsupportedEncodingException {
+    private MimeMessage createEmptyMail(final Run<?, ?> run, final TaskListener listener) throws MessagingException, UnsupportedEncodingException {
         MimeMessageBuilder messageBuilder = new MimeMessageBuilder()
                 .setCharset(charset)
                 .setListener(listener);
@@ -388,10 +392,12 @@ public class MailSender {
         // TODO: I'd like to put the URL to the page in here,
         // but how do I obtain that?
 
+        final AbstractBuild<?, ?> build = run instanceof AbstractBuild ? ((AbstractBuild<?, ?>)run) : null;
+
         StringTokenizer tokens = new StringTokenizer(recipients);
         while (tokens.hasMoreTokens()) {
             String address = tokens.nextToken();
-            if (build instanceof AbstractBuild && address.startsWith("upstream-individuals:")) {
+            if (build != null && address.startsWith("upstream-individuals:")) {
                 // people who made a change in the upstream
                 String projectName = address.substring("upstream-individuals:".length());
                 // TODO 1.590+ Jenkins.getActiveInstance
@@ -400,47 +406,43 @@ public class MailSender {
                     listener.getLogger().println("Jenkins is not ready. Cannot retrieve project "+projectName);
                     continue;
                 }
-                final AbstractProject up = jenkins.getItem(projectName, build.getParent(), AbstractProject.class);
+                final AbstractProject up = jenkins.getItem(projectName, run.getParent(), AbstractProject.class);
                 if(up==null) {
                     listener.getLogger().println("No such project exist: "+projectName);
                     continue;
                 }
-                messageBuilder.addRecipients(getCulpritsOfEmailList(up, (AbstractBuild) build, listener));
+                messageBuilder.addRecipients(getCulpritsOfEmailList(up, build, listener));
             } else {
                 // ordinary address
                 messageBuilder.addRecipients(address);
             }
         }
 
-        for (AbstractProject project : includeUpstreamCommitters) {
-            messageBuilder.addRecipients(getCulpritsOfEmailList(project, (AbstractBuild) build, listener));
-        }
-
-        if (sendToIndividuals) {
-            Set<User> culprits = getCulprits(build);
-
-            if(debug)
-                listener.getLogger().println("Trying to send e-mails to individuals who broke the build. sizeof(culprits)=="+culprits.size());
-
-            messageBuilder.addRecipients(getUserEmailList(listener, culprits));
+        if (build != null) {
+            for (AbstractProject project : includeUpstreamCommitters) {
+                messageBuilder.addRecipients(getCulpritsOfEmailList(project, build, listener));
+            }
+            if (sendToIndividuals) {
+                messageBuilder.addRecipients(getUserEmailList(listener, build));
+            }
         }
         
         // set recipients after filtering out recipients that should not receive emails
         messageBuilder.setRecipientFilter(new MimeMessageBuilder.AddressFilter() {
             @Override
             public Set<InternetAddress> apply(Set<InternetAddress> recipients) {
-                return MailAddressFilter.filterRecipients(build, listener, recipients);
+                return MailAddressFilter.filterRecipients(run, listener, recipients);
             }
         });
 
         MimeMessage msg = messageBuilder.buildMimeMessage();
 
-        msg.addHeader("X-Jenkins-Job", build.getParent().getFullName());
+        msg.addHeader("X-Jenkins-Job", run.getParent().getFullName());
         
-        final Result result = build.getResult();
+        final Result result = run.getResult();
         msg.addHeader("X-Jenkins-Result", result != null ? result.toString() : "in progress");
 
-        Run<?, ?> pb = build.getPreviousBuild();
+        Run<?, ?> pb = run.getPreviousBuild();
         if(pb!=null) {
             MailMessageIdAction b = pb.getAction(MailMessageIdAction.class);
             if(b!=null) {
@@ -469,7 +471,7 @@ public class MailSender {
         do {
             b = b.getNextBuild();
             if (b != null) {
-                String userEmails = getUserEmailList(listener, b.getCulprits());
+                String userEmails = getUserEmailList(listener, b);
                 if (culpritEmails.length() > 0) {
                     culpritEmails.append(",");
                 }
@@ -480,14 +482,40 @@ public class MailSender {
         return culpritEmails.toString();
     }
 
+    /** If set, send to known users who lack {@link Item#READ} access to the job. */
+    static /* not final */ boolean SEND_TO_USERS_WITHOUT_READ = Boolean.getBoolean(MailSender.class.getName() + ".SEND_TO_USERS_WITHOUT_READ");
+    /** If set, send to unknown users. */
+    static /* not final */ boolean SEND_TO_UNKNOWN_USERS = Boolean.getBoolean(MailSender.class.getName() + ".SEND_TO_UNKNOWN_USERS");
+
     @Nonnull
-    private String getUserEmailList(TaskListener listener, Set<User> users) throws AddressException, UnsupportedEncodingException {
+    String getUserEmailList(TaskListener listener, AbstractBuild<?, ?> build) throws AddressException, UnsupportedEncodingException {
+        Set<User> users = getCulprits(build);
         StringBuilder userEmails = new StringBuilder();
         for (User a : users) {
             String adrs = Util.fixEmpty(a.getProperty(Mailer.UserProperty.class).getAddress());
             if(debug)
                 listener.getLogger().println("  User "+a.getId()+" -> "+adrs);
             if (adrs != null) {
+                if (Jenkins.getActiveInstance().isUseSecurity()) {
+                    try {
+                        Authentication auth = a.impersonate();
+                        if (!build.getACL().hasPermission(auth, Item.READ)) {
+                            if (SEND_TO_USERS_WITHOUT_READ) {
+                                listener.getLogger().println(Messages.MailSender_warning_user_without_read(adrs, build.getFullDisplayName()));
+                            } else {
+                                listener.getLogger().println(Messages.MailSender_user_without_read(adrs, build.getFullDisplayName()));
+                                continue;
+                            }
+                        }
+                    } catch (UsernameNotFoundException x) {
+                        if (SEND_TO_UNKNOWN_USERS) {
+                            listener.getLogger().println(Messages.MailSender_warning_unknown_user(adrs));
+                        } else {
+                            listener.getLogger().println(Messages.MailSender_unknown_user(adrs));
+                            continue;
+                        }
+                    }
+                }
                 if (userEmails.length() > 0) {
                     userEmails.append(",");
                 }
